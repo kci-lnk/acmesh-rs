@@ -1,0 +1,40 @@
+# Rust build output
+/target/
+**/*.rs.bk
+
+# Release artifacts
+/artifacts/
+/dist/
+*.zip
+*.tar.gz
+*.sha256
+
+# ACME runtime data and private material
+/.acme.sh/
+/acme-data/
+account.conf
+*.key
+*.pem
+*.p12
+*.pfx
+*.csr
+*.cer
+
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
+
+# Editors and operating systems
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Test and coverage output
+coverage/
+*.profraw
+lcov.info

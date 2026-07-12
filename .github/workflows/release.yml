@@ -1,0 +1,97 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Package ${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: windows-2025
+            target: x86_64-pc-windows-msvc
+            os: windows
+            extension: .exe
+          - runner: windows-11-arm
+            target: aarch64-pc-windows-msvc
+            os: windows
+            extension: .exe
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-musl
+            os: unix
+            musl: true
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+            os: unix
+            musl: true
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+            os: unix
+          - runner: macos-15
+            target: aarch64-apple-darwin
+            os: unix
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}
+      - name: Install musl tools
+        if: matrix.musl
+        run: sudo apt-get update && sudo apt-get install --yes musl-tools
+      - run: cargo build --locked --release --target ${{ matrix.target }}
+      - name: Package Windows archive
+        if: matrix.os == 'windows'
+        shell: pwsh
+        run: |
+          $name = "rust-acmesh-${{ github.ref_name }}-${{ matrix.target }}"
+          New-Item -ItemType Directory -Force "artifacts/$name" | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/rust-acmesh.exe", README.md, LICENSE "artifacts/$name"
+          Compress-Archive -Path "artifacts/$name" -DestinationPath "artifacts/$name.zip"
+          $hash = (Get-FileHash "artifacts/$name.zip" -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$hash  $name.zip" | Set-Content -NoNewline "artifacts/$name.zip.sha256"
+          Remove-Item -Recurse "artifacts/$name"
+      - name: Package Unix archive
+        if: matrix.os == 'unix'
+        shell: bash
+        run: |
+          set -euo pipefail
+          name="rust-acmesh-${{ github.ref_name }}-${{ matrix.target }}"
+          mkdir -p "artifacts/$name"
+          cp "target/${{ matrix.target }}/release/rust-acmesh" README.md LICENSE "artifacts/$name/"
+          tar -C artifacts -czf "artifacts/$name.tar.gz" "$name"
+          if command -v sha256sum >/dev/null; then
+            (cd artifacts && sha256sum "$name.tar.gz" > "$name.tar.gz.sha256")
+          else
+            hash="$(shasum -a 256 "artifacts/$name.tar.gz" | awk '{print $1}')"
+            printf '%s  %s\n' "$hash" "$name.tar.gz" > "artifacts/$name.tar.gz.sha256"
+          fi
+          rm -rf "artifacts/$name"
+      - uses: actions/upload-artifact@v6
+        with:
+          name: ${{ matrix.target }}
+          path: artifacts/*
+          if-no-files-found: error
+
+  publish:
+    name: Publish GitHub release
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v7
+        with:
+          path: artifacts
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: artifacts/*
