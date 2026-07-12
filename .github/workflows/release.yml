@@ -76,7 +76,7 @@ jobs:
             printf '%s  %s\n' "$hash" "$name.tar.gz" > "artifacts/$name.tar.gz.sha256"
           fi
           rm -rf "artifacts/$name"
-      - uses: actions/upload-artifact@v6
+      - uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.target }}
           path: artifacts/*
