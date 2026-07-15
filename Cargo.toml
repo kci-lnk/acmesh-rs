@@ -26,7 +26,7 @@ strip = "symbols"
 anyhow = "1"
 base64 = "0.22"
 clap = { version = "4.5", default-features = false, features = ["derive", "std", "help", "usage"] }
-hmac = "0.12"
+hmac = "0.13"
 p256 = { version = "0.13", features = ["ecdsa", "pkcs8"] }
 p384 = { version = "0.13", features = ["ecdsa", "pkcs8"] }
 p12 = { version = "0.6", optional = true }
