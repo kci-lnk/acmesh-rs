@@ -243,6 +243,8 @@ pub fn credentials(args: &Args) -> HashMap<String, String> {
         "PORKBUN_DOMAIN",
         "BAIDU_ACCESS_KEY_ID",
         "BAIDU_SECRET_ACCESS_KEY",
+        "BAIDU_DOMAIN",
+        "root_domain",
         "Dynu_ClientId",
         "Dynu_Secret",
         "DYNV6_TOKEN",

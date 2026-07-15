@@ -52,7 +52,7 @@ impl Dns {
             ),
             "dns_huaweicloud" => self.huaweicloud(add, name, value).await,
             _ => bail!(
-                "unsupported DNS provider {}; supported: dns_ali,dns_baiducloud,dns_cf,dns_dp,dns_duckdns,dns_dynu,dns_dynv6,dns_gd,dns_huaweicloud,dns_noip,dns_porkbun,dns_tencent",
+                "unsupported DNS provider {}; supported: dns_ali,dns_baiducloud,dns_cf,dns_dp,dns_duckdns,dns_dynu,dns_dynv6,dns_gd,dns_huaweicloud,dns_porkbun,dns_tencent",
                 self.provider
             ),
         }
@@ -74,8 +74,14 @@ impl Dns {
         {
             Some(zone) => zone.clone(),
             None => {
-                self.cloudflare_zone_id(name, token, global_key, email)
-                    .await?
+                self.cloudflare_zone_id(
+                    name,
+                    token,
+                    global_key,
+                    email,
+                    self.vars.get("CF_Account_ID").map(String::as_str),
+                )
+                .await?
             }
         };
         let base = format!("https://api.cloudflare.com/client/v4/zones/{zone}/dns_records");
@@ -84,11 +90,12 @@ impl Dns {
                 .json(&json!({"type":"TXT","name":name,"content":value,"ttl":120}))
                 .send()
                 .await?;
-            let response: Value = r.error_for_status()?.json().await?;
+            let status = r.status();
+            let response: Value = r.json().await?;
             if response["success"] == true || cloudflare_duplicate(&response) {
                 Ok(())
             } else {
-                bail!("Cloudflare create TXT record failed: {response}")
+                bail!("Cloudflare create TXT record failed ({status}): {response}")
             }
         } else {
             let r = cloudflare_auth(self.client.get(&base), token, global_key, email)
@@ -122,8 +129,13 @@ impl Dns {
         token: Option<&String>,
         global_key: Option<&String>,
         email: Option<&String>,
+        account_id: Option<&str>,
     ) -> Result<String> {
         for candidate in zone_candidates(name) {
+            let mut query = vec![("name", candidate.as_str()), ("status", "active")];
+            if let Some(account_id) = account_id {
+                query.push(("account.id", account_id));
+            }
             let response: Value = cloudflare_auth(
                 self.client
                     .get("https://api.cloudflare.com/client/v4/zones"),
@@ -131,7 +143,7 @@ impl Dns {
                 global_key,
                 email,
             )
-            .query(&[("name", candidate.as_str()), ("status", "active")])
+            .query(&query)
             .send()
             .await?
             .error_for_status()?
@@ -166,7 +178,7 @@ impl Dns {
             Some(root) => root.clone(),
             None => self.dnspod_zone(name, id, key).await?,
         };
-        let sub = name.strip_suffix(&format!(".{root}")).unwrap_or("@");
+        let sub = dns_rr_for_root(name, &root)?;
         let list = self
             .client
             .post("https://dnsapi.cn/Record.List")
@@ -198,7 +210,7 @@ impl Dns {
                 .send()
                 .await?;
             let v: Value = r.error_for_status()?.json().await?;
-            if v["status"]["code"] != "1" {
+            if !dnspod_add_success(&v) {
                 bail!("DNSPod add failed: {}", v);
             }
         } else if let Some(record_id) = list["records"]
@@ -251,25 +263,26 @@ impl Dns {
             .get("DuckDNS_Token")
             .or_else(|| self.vars.get("token"))
             .context("DuckDNS_Token is required")?;
-        let host = name
-            .strip_prefix("_acme-challenge.")
-            .unwrap_or(name)
-            .split('.')
-            .next()
-            .unwrap_or(name);
-        let txt = if add { value } else { "" };
-        let v: Value = self
+        let host = duckdns_domain(name)?;
+        let mut query = vec![
+            ("domains", host.as_str()),
+            ("token", token.as_str()),
+            ("txt", if add { value } else { "" }),
+        ];
+        if !add {
+            query.push(("clear", "true"));
+        }
+        let response = self
             .client
             .get("https://www.duckdns.org/update")
-            .query(&[("domains", host), ("token", token), ("txt", txt)])
+            .query(&query)
             .send()
             .await?
             .error_for_status()?
-            .json()
-            .await
-            .unwrap_or_else(|_| json!("OK"));
-        if v.as_str() != Some("OK") && v != json!("OK") {
-            bail!("DuckDNS update failed: {v}");
+            .text()
+            .await?;
+        if response.trim() != "OK" {
+            bail!("DuckDNS update failed: {response}");
         }
         Ok(())
     }
@@ -284,7 +297,14 @@ impl Dns {
             .get("GD_Secret")
             .or_else(|| self.vars.get("api_secret"))
             .context("GD_Secret is required")?;
-        let (root, sub) = root_sub(name, self.vars.get("GD_Domain").map(String::as_str));
+        let (root, sub) = self
+            .godaddy_root(
+                name,
+                self.vars.get("GD_Domain").map(String::as_str),
+                key,
+                secret,
+            )
+            .await?;
         let url = format!("https://api.godaddy.com/v1/domains/{root}/records/TXT/{sub}");
         let auth = format!("sso-key {key}:{secret}");
         let existing: Value = self
@@ -330,6 +350,47 @@ impl Dns {
         }
         Ok(())
     }
+    async fn godaddy_root(
+        &self,
+        name: &str,
+        configured: Option<&str>,
+        key: &str,
+        secret: &str,
+    ) -> Result<(String, String)> {
+        if let Some(root) = configured {
+            let root = root.trim_end_matches('.').to_string();
+            return Ok((root.clone(), dns_rr_for_root(name, &root)?));
+        }
+        let auth = format!("sso-key {key}:{secret}");
+        let mut last_status = None;
+        for root in all_zone_candidates(name) {
+            let response = self
+                .client
+                .get(format!("https://api.godaddy.com/v1/domains/{root}"))
+                .header("Authorization", &auth)
+                .send()
+                .await?;
+            let status = response.status();
+            if status.is_success() {
+                let sub = dns_rr_for_root(name, &root)?;
+                return Ok((root, sub));
+            }
+            if matches!(
+                status,
+                reqwest::StatusCode::UNAUTHORIZED
+                    | reqwest::StatusCode::FORBIDDEN
+                    | reqwest::StatusCode::TOO_MANY_REQUESTS
+            ) {
+                let body = response.text().await.unwrap_or_default();
+                bail!("GoDaddy zone discovery failed ({status}): {body}")
+            }
+            last_status = Some(status);
+        }
+        bail!(
+            "GoDaddy zone was not found; pass GD_Domain if zone discovery is unavailable. Last HTTP status: {}",
+            last_status.map_or_else(|| "none".to_string(), |status| status.to_string())
+        )
+    }
     async fn porkbun(&self, add: bool, name: &str, value: &str) -> Result<()> {
         let api = self
             .vars
@@ -339,42 +400,37 @@ impl Dns {
             .vars
             .get("PORKBUN_SECRET_API_KEY")
             .context("PORKBUN_SECRET_API_KEY is required")?;
-        let (root, sub) = root_sub(name, self.vars.get("PORKBUN_DOMAIN").map(String::as_str));
+        let credentials = json!({"apikey":api,"secretapikey":secret});
+        let (root, sub) = self
+            .porkbun_root(
+                name,
+                self.vars.get("PORKBUN_DOMAIN").map(String::as_str),
+                &credentials,
+            )
+            .await?;
         if add {
-            let v:Value=self.client.post(format!("https://porkbun.com/api/json/v3/dns/create/{root}")).json(&json!({"apikey":api,"secretapikey":secret,"name":sub,"type":"TXT","content":value,"ttl":300})).send().await?.error_for_status()?.json().await?;
-            if v["status"] != "SUCCESS" {
+            let (_, v) = self
+                .porkbun_request(
+                    &format!("dns/create/{root}"),
+                    &json!({"apikey":api,"secretapikey":secret,"name":porkbun_subdomain(&sub),"type":"TXT","content":value,"ttl":600}),
+                )
+                .await?;
+            let duplicate = v["message"]
+                .as_str()
+                .is_some_and(|message| message.to_ascii_lowercase().contains("already exists"));
+            if v["status"] != "SUCCESS" && !duplicate {
                 bail!("Porkbun add failed: {v}");
             }
         } else {
-            let records: Value = self
-                .client
-                .post(format!(
-                    "https://porkbun.com/api/json/v3/dns/retrieve/{root}"
-                ))
-                .json(&json!({"apikey":api,"secretapikey":secret}))
-                .send()
-                .await?
-                .error_for_status()?
-                .json()
+            let (_, records) = self
+                .porkbun_request(&format!("dns/retrieve/{root}"), &credentials)
                 .await?;
-            if let Some(id) = records["records"]
-                .as_array()
-                .and_then(|rs| {
-                    rs.iter()
-                        .find(|r| r["type"] == "TXT" && r["name"] == sub && r["content"] == value)
-                })
-                .and_then(|r| r["id"].as_str())
-            {
-                let result: Value = self
-                    .client
-                    .post(format!(
-                        "https://porkbun.com/api/json/v3/dns/delete/{root}/{id}"
-                    ))
-                    .json(&json!({"apikey":api,"secretapikey":secret}))
-                    .send()
-                    .await?
-                    .error_for_status()?
-                    .json()
+            if records["status"] != "SUCCESS" {
+                bail!("Porkbun retrieve failed: {records}");
+            }
+            if let Some(id) = porkbun_record_id(&records, name, value) {
+                let (_, result) = self
+                    .porkbun_request(&format!("dns/delete/{root}/{id}"), &credentials)
                     .await?;
                 if result["status"] != "SUCCESS" {
                     bail!("Porkbun delete failed: {result}");
@@ -383,27 +439,132 @@ impl Dns {
         }
         Ok(())
     }
+    async fn porkbun_root(
+        &self,
+        name: &str,
+        configured: Option<&str>,
+        credentials: &Value,
+    ) -> Result<(String, String)> {
+        if let Some(root) = configured {
+            let root = root.trim_end_matches('.').to_string();
+            return Ok((root.clone(), dns_rr_for_root(name, &root)?));
+        }
+        let mut last_response = Value::Null;
+        for root in all_zone_candidates(name) {
+            let (status, response) = self
+                .porkbun_request(&format!("dns/retrieve/{root}"), credentials)
+                .await?;
+            if status.is_success() && response["status"] == "SUCCESS" {
+                let sub = dns_rr_for_root(name, &root)?;
+                return Ok((root, sub));
+            }
+            if porkbun_fatal_discovery_error(status, &response) {
+                bail!("Porkbun zone discovery failed ({status}): {response}")
+            }
+            last_response = response;
+        }
+        bail!("Porkbun zone was not found: {last_response}")
+    }
+    async fn porkbun_request(
+        &self,
+        path: &str,
+        body: &Value,
+    ) -> Result<(reqwest::StatusCode, Value)> {
+        for attempt in 0..2 {
+            let response = self
+                .client
+                .post(format!("https://api.porkbun.com/api/json/v3/{path}"))
+                .json(body)
+                .send()
+                .await?;
+            let status = response.status();
+            let retry_after = response
+                .headers()
+                .get("Retry-After")
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.parse::<u64>().ok());
+            let text = response.text().await?;
+            let value: Value = serde_json::from_str(&text).with_context(|| {
+                format!("Porkbun returned non-JSON response ({status}): {text}")
+            })?;
+            if status == reqwest::StatusCode::TOO_MANY_REQUESTS && attempt == 0 {
+                let delay = retry_after
+                    .or_else(|| value["ttlRemaining"].as_u64())
+                    .unwrap_or(3)
+                    .clamp(1, 60);
+                tokio::time::sleep(Duration::from_secs(delay)).await;
+                continue;
+            }
+            tokio::time::sleep(Duration::from_secs(3)).await;
+            return Ok((status, value));
+        }
+        unreachable!("Porkbun retry loop always returns on its final attempt")
+    }
     async fn dynv6(&self, add: bool, name: &str, value: &str) -> Result<()> {
         let token = self
             .vars
             .get("DYNV6_TOKEN")
             .or_else(|| self.vars.get("token"))
             .context("DYNV6_TOKEN is required")?;
-        let host = name.strip_prefix("_acme-challenge.").unwrap_or(name);
-        let r = self
+        let zones: Value = self
             .client
-            .get("https://dynv6.com/api/update")
-            .query(&[
-                ("hostname", host),
-                ("token", token),
-                ("txt", if add { value } else { "" }),
-            ])
+            .get("https://dynv6.com/api/v2/zones")
+            .bearer_auth(token)
             .send()
             .await?
-            .error_for_status()?;
-        let text = r.text().await?;
-        if !text.contains("good") && !text.contains("nochg") {
-            bail!("dynv6 update failed: {text}");
+            .error_for_status()?
+            .json()
+            .await?;
+        let zones = value_array(&zones, "zones").context("dynv6 returned no zones array")?;
+        let zone = zones
+            .iter()
+            .filter_map(|zone| {
+                let zone_name = zone["name"].as_str()?;
+                if dns_name_is_in_zone(name, zone_name) {
+                    Some((zone_name.len(), zone))
+                } else {
+                    None
+                }
+            })
+            .max_by_key(|(length, _)| *length)
+            .map(|(_, zone)| zone)
+            .context("dynv6 zone not found")?;
+        let zone_name = zone["name"].as_str().context("dynv6 zone name missing")?;
+        let zone_id = json_id(zone.get("id")).context("dynv6 zone id missing")?;
+        let record_name = dns_rr_for_root(name, zone_name)?;
+        let base = format!("https://dynv6.com/api/v2/zones/{zone_id}/records");
+        let records: Value = self
+            .client
+            .get(&base)
+            .bearer_auth(token)
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        let records =
+            value_array(&records, "records").context("dynv6 returned no records array")?;
+        let existing = records.iter().find(|record| {
+            record["type"] == "TXT" && record["name"] == record_name && record["data"] == value
+        });
+        if add {
+            if existing.is_none() {
+                self.client
+                    .post(&base)
+                    .bearer_auth(token)
+                    .json(&json!({"name":record_name,"data":value,"type":"TXT"}))
+                    .send()
+                    .await?
+                    .error_for_status()?;
+            }
+        } else if let Some(record) = existing {
+            let record_id = json_id(record.get("id")).context("dynv6 record id missing")?;
+            self.client
+                .delete(format!("{base}/{record_id}"))
+                .bearer_auth(token)
+                .send()
+                .await?
+                .error_for_status()?;
         }
         Ok(())
     }
@@ -585,7 +746,13 @@ impl Dns {
                 .await?;
             if let Some(record) = list
                 .as_array()
-                .and_then(|a| a.iter().find(|x| x["textData"] == value))
+                .and_then(|records| {
+                    records.iter().find(|record| {
+                        record["nodeName"] == node
+                            && record["recordType"] == "TXT"
+                            && record["textData"] == value
+                    })
+                })
                 .and_then(|x| x["id"].as_i64())
             {
                 self.client
@@ -607,11 +774,10 @@ impl Dns {
             .vars
             .get("Tencent_SecretKey")
             .context("Tencent_SecretKey is required")?;
-        let parts: Vec<_> = name.split('.').collect();
         let mut found = None;
-        for i in 1..parts.len() {
-            let root = parts[i..].join(".");
-            if self
+        let mut last_error = None;
+        for root in all_zone_candidates(name) {
+            match self
                 .tencent_call(
                     id,
                     secret,
@@ -619,29 +785,50 @@ impl Dns {
                     json!({"Domain":root,"Limit":1}),
                 )
                 .await
-                .is_ok()
             {
-                found = Some((root, parts[..i].join(".")));
-                break;
+                Ok(_) => {
+                    let sub = dns_rr_for_root(name, &root)?;
+                    found = Some((root, sub));
+                    break;
+                }
+                Err(error) => last_error = Some(error.to_string()),
             }
         }
-        let (domain, sub) = found.context("Tencent Cloud DNS zone not found")?;
+        let (domain, sub) = found.with_context(|| {
+            format!(
+                "Tencent Cloud DNS zone not found. Last API error: {}",
+                last_error.as_deref().unwrap_or("none")
+            )
+        })?;
         if add {
-            self.tencent_call(id,secret,"CreateRecord",json!({"Domain":domain,"SubDomain":sub,"RecordType":"TXT","RecordLine":"默认","Value":value,"TTL":600})).await?;
+            self.tencent_call(id,secret,"CreateRecord",json!({"Domain":domain,"SubDomain":sub,"RecordType":"TXT","RecordLineId":"0","RecordLine":"0","Value":value,"TTL":600})).await?;
         } else {
-            let records = self
-                .tencent_call(
-                    id,
-                    secret,
-                    "DescribeRecordFilterList",
-                    json!({"Domain":domain,"SubDomain":sub,"RecordValue":value}),
-                )
-                .await?;
-            if let Some(record_id) = records["Response"]["RecordList"]
-                .as_array()
-                .and_then(|a| a.first())
-                .and_then(|v| v["RecordId"].as_i64())
-            {
+            let mut record_id = None;
+            for attempt in 0..5 {
+                let records = self
+                    .tencent_call(
+                        id,
+                        secret,
+                        "DescribeRecordFilterList",
+                        json!({"Domain":domain,"SubDomain":sub,"RecordValue":value}),
+                    )
+                    .await?;
+                record_id = records["Response"]["RecordList"]
+                    .as_array()
+                    .and_then(|records| {
+                        records.iter().find(|record| {
+                            record["Name"] == sub
+                                && record["Type"] == "TXT"
+                                && record["Value"] == value
+                        })
+                    })
+                    .and_then(|record| record["RecordId"].as_i64());
+                if record_id.is_some() || attempt == 4 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_secs(10)).await;
+            }
+            if let Some(record_id) = record_id {
                 self.tencent_call(
                     id,
                     secret,
@@ -737,10 +924,8 @@ impl Dns {
             .context("HuaweiCloud did not return X-Subject-Token")?
             .to_str()?
             .to_string();
-        let parts: Vec<_> = name.split('.').collect();
         let mut zone = None;
-        for i in 1..parts.len() {
-            let root = parts[i..].join(".");
+        for root in all_zone_candidates(name) {
             let result: Value = self
                 .client
                 .get(format!("{endpoint}/v2/zones"))
@@ -777,7 +962,9 @@ impl Dns {
             .error_for_status()?
             .json()
             .await?;
-        let recordset = existing["recordsets"].as_array().and_then(|x| x.first());
+        let recordset = existing["recordsets"]
+            .as_array()
+            .and_then(|records| records.iter().find(|record| record["type"] == "TXT"));
         let quoted = format!("\"{value}\"");
         if add {
             let mut records = recordset
@@ -848,36 +1035,99 @@ impl Dns {
             .get("BAIDU_SECRET_ACCESS_KEY")
             .or_else(|| self.vars.get("secret_access_key"))
             .context("BAIDU_SECRET_ACCESS_KEY is required")?;
-        let (root, record) = root_sub(name, self.vars.get("root_domain").map(String::as_str));
-        let list = self
-            .baidu_call(
-                access,
-                secret,
-                "/v1/domain/resolve/list",
-                json!({"domain":root,"pageNum":1,"pageSize":1000}),
-            )
+        let configured = self
+            .vars
+            .get("root_domain")
+            .or_else(|| self.vars.get("BAIDU_DOMAIN"))
+            .map(String::as_str);
+        let (root, record) = self
+            .baiducloud_root(name, configured, access, secret)
             .await?;
-        let existing = list["result"].as_array().and_then(|rs| {
-            rs.iter()
-                .find(|r| r["domain"] == record && r["rdType"] == "TXT" && r["rdata"] == value)
-        });
+        let mut existing_id = None;
+        let mut existing = false;
+        let mut page = 1_u64;
+        loop {
+            let list = self
+                .baidu_call(
+                    access,
+                    secret,
+                    "/v1/domain/resolve/list",
+                    json!({"domain":root,"pageNo":page,"pageSize":100}),
+                )
+                .await?;
+            let records = list["result"].as_array();
+            if let Some(found) = records.and_then(|records| {
+                records.iter().find(|item| {
+                    item["domain"] == record && item["rdtype"] == "TXT" && item["rdata"] == value
+                })
+            }) {
+                existing = true;
+                existing_id = found["recordId"].as_i64();
+                break;
+            }
+            let returned = records.map_or(0, Vec::len) as u64;
+            let total = list["totalCount"].as_u64().unwrap_or(returned);
+            if returned == 0 || page * 100 >= total {
+                break;
+            }
+            page += 1;
+        }
         if add {
-            if existing.is_none() {
+            if !existing {
                 let response = self.baidu_call(access,secret,"/v1/domain/resolve/add",json!({"domain":record,"rdType":"TXT","ttl":300,"rdata":value,"zoneName":root})).await?;
                 baidu_ok(&response)?;
             }
-        } else if let Some(id) = existing.and_then(|r| r["recordId"].as_i64()) {
+        } else if existing && existing_id.is_none() {
+            bail!("Baidu Cloud DNS record is missing recordId")
+        } else if let Some(id) = existing_id {
             let response = self
                 .baidu_call(
                     access,
                     secret,
                     "/v1/domain/resolve/delete",
-                    json!({"recordId":id}),
+                    baidu_delete_body(&root, id),
                 )
                 .await?;
             baidu_ok(&response)?;
         }
         Ok(())
+    }
+    async fn baiducloud_root(
+        &self,
+        name: &str,
+        configured: Option<&str>,
+        access: &str,
+        secret: &str,
+    ) -> Result<(String, String)> {
+        if let Some(root) = configured {
+            let root = root.trim_end_matches('.').to_string();
+            return Ok((root.clone(), dns_rr_for_root(name, &root)?));
+        }
+        let mut last_error = None;
+        for root in all_zone_candidates(name) {
+            match self
+                .baidu_call(
+                    access,
+                    secret,
+                    "/v1/domain/resolve/list",
+                    json!({"domain":root,"pageNo":1,"pageSize":1}),
+                )
+                .await
+            {
+                Ok(response)
+                    if response.get("result").is_some() || response.get("totalCount").is_some() =>
+                {
+                    let record = dns_rr_for_root(name, &root)?;
+                    return Ok((root, record));
+                }
+                Ok(response) => last_error = Some(format!("unexpected response: {response}")),
+                Err(error) => last_error = Some(error.to_string()),
+            }
+        }
+        bail!(
+            "Baidu Cloud DNS zone was not found; pass root_domain or BAIDU_DOMAIN. Last API error: {}",
+            last_error.as_deref().unwrap_or("none")
+        )
     }
     async fn baidu_call(
         &self,
@@ -887,13 +1137,11 @@ impl Dns {
         body: Value,
     ) -> Result<Value> {
         let url = format!("https://bcd.baidubce.com{path}");
-        let timestamp = time::OffsetDateTime::now_utc()
-            .format(&time::format_description::well_known::Rfc3339)?;
-        let timestamp = timestamp.trim_end_matches('Z').replace("+00:00", "") + "Z";
+        let timestamp = bce_timestamp()?;
         let prefix = format!("bce-auth-v1/{access}/{timestamp}/1800");
         let headers = "content-type:application%2Fjson\nhost:bcd.baidubce.com\nx-bce-date:"
             .to_string()
-            + &enc(&timestamp);
+            + &ali_percent_encode(&timestamp);
         let signing_key = hex(&hmac256(secret.as_bytes(), prefix.as_bytes())?);
         let canonical = format!("POST\n{path}\n\n{headers}");
         let signature = hex(&hmac256(signing_key.as_bytes(), canonical.as_bytes())?);
@@ -907,9 +1155,15 @@ impl Dns {
             .header("Authorization", authorization)
             .json(&body)
             .send()
-            .await?
-            .error_for_status()?;
-        Ok(response.json().await?)
+            .await?;
+        let status = response.status();
+        let text = response.text().await?;
+        let value = json_or_null(&text)
+            .with_context(|| format!("Baidu Cloud DNS returned invalid JSON ({status}): {text}"))?;
+        if !status.is_success() {
+            bail!("Baidu Cloud DNS API request failed ({status}): {value}")
+        }
+        Ok(value)
     }
     async fn ali_request(&self, params: Vec<(&str, String)>, secret: &str) -> Result<Value> {
         let (status, value) = self.ali_request_raw(params, secret).await?;
@@ -970,33 +1224,135 @@ fn ali_percent_encode(value: &str) -> String {
 }
 
 fn ali_rr_for_root(name: &str, root: &str) -> Result<String> {
-    let name = name.trim_end_matches('.');
-    let root = root.trim_end_matches('.');
-    if name == root {
-        return Ok("@".into());
-    }
-    name.strip_suffix(&format!(".{root}"))
-        .filter(|rr| !rr.is_empty())
-        .map(str::to_string)
-        .with_context(|| format!("{name} is not inside AliDNS zone {root}"))
+    dns_rr_for_root(name, root)
 }
 
-fn root_sub(name: &str, configured: Option<&str>) -> (String, String) {
-    let clean = name.strip_prefix("_acme-challenge.").unwrap_or(name);
-    let root = configured.map(str::to_string).unwrap_or_else(|| {
-        let p: Vec<_> = clean.split('.').collect();
-        if p.len() >= 2 {
-            p[p.len() - 2..].join(".")
-        } else {
-            clean.to_string()
+fn dns_rr_for_root(name: &str, root: &str) -> Result<String> {
+    let name = name.trim_end_matches('.');
+    let root = root.trim_end_matches('.');
+    let name_lower = name.to_ascii_lowercase();
+    let root_lower = root.to_ascii_lowercase();
+    if name_lower == root_lower {
+        return Ok("@".into());
+    }
+    let suffix = format!(".{root_lower}");
+    if name_lower.ends_with(&suffix) {
+        let rr_length = name.len() - suffix.len();
+        if rr_length > 0 {
+            return Ok(name[..rr_length].to_string());
         }
-    });
-    let sub = clean
-        .strip_suffix(&format!(".{root}"))
-        .unwrap_or("")
-        .to_string();
-    (root, if sub.is_empty() { "@".into() } else { sub })
+    }
+    bail!("{name} is not inside DNS zone {root}")
 }
+
+fn all_zone_candidates(name: &str) -> Vec<String> {
+    let clean = name.trim_end_matches('.');
+    let labels = clean.split('.').collect::<Vec<_>>();
+    (0..labels.len().saturating_sub(1))
+        .map(|index| labels[index..].join("."))
+        .collect()
+}
+
+fn dns_name_is_in_zone(name: &str, zone: &str) -> bool {
+    let name = name.trim_end_matches('.').to_ascii_lowercase();
+    let zone = zone.trim_end_matches('.').to_ascii_lowercase();
+    name == zone || name.ends_with(&format!(".{zone}"))
+}
+
+fn duckdns_domain(name: &str) -> Result<String> {
+    let clean = name
+        .trim_end_matches('.')
+        .strip_prefix("_acme-challenge.")
+        .unwrap_or(name.trim_end_matches('.'))
+        .to_ascii_lowercase();
+    let labels = clean.split('.').collect::<Vec<_>>();
+    if labels.len() < 3
+        || labels[labels.len() - 2] != "duckdns"
+        || labels[labels.len() - 1] != "org"
+    {
+        bail!("invalid DuckDNS challenge name: {name}");
+    }
+    let domain = labels[labels.len() - 3];
+    if domain.is_empty()
+        || !domain
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+    {
+        bail!("invalid DuckDNS domain in challenge name: {name}");
+    }
+    Ok(domain.to_string())
+}
+
+fn value_array<'a>(value: &'a Value, key: &str) -> Option<&'a Vec<Value>> {
+    value.as_array().or_else(|| value[key].as_array())
+}
+
+fn json_id(value: Option<&Value>) -> Option<String> {
+    let value = value?;
+    value
+        .as_str()
+        .map(str::to_string)
+        .or_else(|| value.as_u64().map(|id| id.to_string()))
+        .or_else(|| value.as_i64().map(|id| id.to_string()))
+}
+
+fn porkbun_subdomain(subdomain: &str) -> &str {
+    if subdomain == "@" { "" } else { subdomain }
+}
+
+fn porkbun_record_id(response: &Value, name: &str, content: &str) -> Option<String> {
+    let expected = name.trim_end_matches('.');
+    response["records"]
+        .as_array()?
+        .iter()
+        .find(|record| {
+            record["type"] == "TXT"
+                && record["name"].as_str().is_some_and(|record_name| {
+                    record_name
+                        .trim_end_matches('.')
+                        .eq_ignore_ascii_case(expected)
+                })
+                && record["content"] == content
+        })
+        .and_then(|record| json_id(record.get("id")))
+}
+
+fn porkbun_fatal_discovery_error(status: reqwest::StatusCode, response: &Value) -> bool {
+    if matches!(
+        status,
+        reqwest::StatusCode::UNAUTHORIZED
+            | reqwest::StatusCode::FORBIDDEN
+            | reqwest::StatusCode::TOO_MANY_REQUESTS
+    ) {
+        return true;
+    }
+    response["code"].as_str().is_some_and(|code| {
+        code.starts_with("INVALID_API_KEYS")
+            || matches!(
+                code,
+                "API_KEY_REQUIRED"
+                    | "MISSING_SECRETAPIKEY"
+                    | "INVALID_TOKEN"
+                    | "INVALID_USER"
+                    | "IP_NOT_ALLOWED"
+                    | "DOMAIN_NOT_ALLOWED"
+                    | "RATE_LIMIT_EXCEEDED"
+            )
+    })
+}
+
+fn json_or_null(body: &str) -> Result<Value> {
+    if body.trim().is_empty() {
+        Ok(Value::Null)
+    } else {
+        Ok(serde_json::from_str(body)?)
+    }
+}
+
+fn baidu_delete_body(zone: &str, record_id: i64) -> Value {
+    json!({"zoneName":zone,"recordId":record_id})
+}
+
 fn zone_candidates(name: &str) -> Vec<String> {
     let clean = name
         .trim_end_matches('.')
@@ -1006,9 +1362,6 @@ fn zone_candidates(name: &str) -> Vec<String> {
     (0..labels.len().saturating_sub(1))
         .map(|index| labels[index..].join("."))
         .collect()
-}
-fn enc(s: &str) -> String {
-    url::form_urlencoded::byte_serialize(s.as_bytes()).collect()
 }
 fn uuid_nonce() -> String {
     use rand::RngCore;
@@ -1022,6 +1375,15 @@ fn time_stamp() -> String {
         .expect("zero is a valid nanosecond")
         .format(&time::format_description::well_known::Rfc3339)
         .expect("UTC timestamps are valid RFC 3339")
+}
+fn bce_timestamp() -> Result<String> {
+    Ok(time::OffsetDateTime::now_utc()
+        .replace_nanosecond(0)
+        .expect("zero is a valid nanosecond")
+        .format(&time::format_description::well_known::Rfc3339)?
+        .trim_end_matches('Z')
+        .replace("+00:00", "")
+        + "Z")
 }
 fn hmac256(key: &[u8], data: &[u8]) -> Result<Vec<u8>> {
     let mut mac = Hmac::<Sha2>::new_from_slice(key)?;
@@ -1054,6 +1416,10 @@ fn cloudflare_duplicate(response: &Value) -> bool {
         })
     })
 }
+fn dnspod_add_success(response: &Value) -> bool {
+    matches!(response["status"]["code"].as_str(), Some("1" | "104"))
+        || matches!(response["status"]["code"].as_i64(), Some(1 | 104))
+}
 fn cloudflare_auth(
     request: reqwest::RequestBuilder,
     token: Option<&String>,
@@ -1081,17 +1447,22 @@ mod tests {
     use super::*;
 
     #[test]
-    fn root_sub_uses_explicit_zone_for_multilevel_suffixes() {
-        let (root, sub) = root_sub("_acme-challenge.api.example.co.uk", Some("example.co.uk"));
-        assert_eq!(root, "example.co.uk");
-        assert_eq!(sub, "api");
+    fn dns_rr_uses_explicit_zone_for_multilevel_suffixes() {
+        let rr = dns_rr_for_root("_acme-challenge.api.example.co.uk", "example.co.uk").unwrap();
+        assert_eq!(rr, "_acme-challenge.api");
     }
 
     #[test]
-    fn root_sub_handles_default_apex() {
-        let (root, sub) = root_sub("_acme-challenge.example.com", None);
-        assert_eq!(root, "example.com");
-        assert_eq!(sub, "@");
+    fn all_zone_candidates_preserve_acme_challenge() {
+        assert_eq!(
+            all_zone_candidates("_acme-challenge.api.example.com.cn"),
+            [
+                "_acme-challenge.api.example.com.cn",
+                "api.example.com.cn",
+                "example.com.cn",
+                "com.cn"
+            ]
+        );
     }
 
     #[test]
@@ -1113,7 +1484,67 @@ mod tests {
     #[test]
     fn alidns_rr_rejects_names_outside_configured_zone() {
         let error = ali_rr_for_root("_acme-challenge.example.net", "example.com").unwrap_err();
-        assert!(error.to_string().contains("is not inside AliDNS zone"));
+        assert!(error.to_string().contains("is not inside DNS zone"));
+    }
+
+    #[test]
+    fn duckdns_extracts_account_domain_from_nested_names() {
+        assert_eq!(
+            duckdns_domain("_acme-challenge.api.foo.duckdns.org").unwrap(),
+            "foo"
+        );
+        assert_eq!(duckdns_domain("foo.duckdns.org.").unwrap(), "foo");
+        assert!(duckdns_domain("_acme-challenge.example.com").is_err());
+    }
+
+    #[test]
+    fn porkbun_matches_fully_qualified_record_names() {
+        let response = json!({
+            "records": [{
+                "id": "42",
+                "name": "_acme-challenge.Example.COM.",
+                "type": "TXT",
+                "content": "challenge"
+            }]
+        });
+        assert_eq!(
+            porkbun_record_id(&response, "_acme-challenge.example.com", "challenge").as_deref(),
+            Some("42")
+        );
+        assert!(porkbun_record_id(&response, "_acme-challenge.example.com", "other").is_none());
+        assert_eq!(porkbun_subdomain("@"), "");
+        assert!(porkbun_fatal_discovery_error(
+            reqwest::StatusCode::BAD_REQUEST,
+            &json!({"code":"INVALID_API_KEYS_002"})
+        ));
+        assert!(!porkbun_fatal_discovery_error(
+            reqwest::StatusCode::BAD_REQUEST,
+            &json!({"code":"INVALID_DOMAIN"})
+        ));
+    }
+
+    #[test]
+    fn provider_json_parser_accepts_empty_success_bodies() {
+        assert_eq!(json_or_null("").unwrap(), Value::Null);
+        assert_eq!(json_or_null("  \n").unwrap(), Value::Null);
+        assert_eq!(json_or_null(r#"{"status":"ok"}"#).unwrap()["status"], "ok");
+        assert!(json_or_null("not json").is_err());
+        assert_eq!(
+            baidu_delete_body("example.com", 42),
+            json!({"zoneName":"example.com","recordId":42})
+        );
+    }
+
+    #[test]
+    fn dns_zone_matching_uses_label_boundaries() {
+        assert!(dns_name_is_in_zone(
+            "_acme-challenge.api.example.com",
+            "example.com"
+        ));
+        assert!(!dns_name_is_in_zone(
+            "_acme-challenge.notexample.com",
+            "example.com"
+        ));
     }
 
     #[test]
@@ -1158,6 +1589,14 @@ mod tests {
     }
 
     #[test]
+    fn baidu_timestamp_has_second_precision() {
+        let timestamp = bce_timestamp().unwrap();
+        assert_eq!(timestamp.len(), 20);
+        assert!(timestamp.ends_with('Z'));
+        assert!(!timestamp.contains('.'));
+    }
+
+    #[test]
     fn zone_candidates_support_multilevel_public_suffixes() {
         assert_eq!(
             zone_candidates("_acme-challenge.api.example.com.cn"),
@@ -1172,6 +1611,14 @@ mod tests {
             &json!({"errors":[{"message":"The record already exists."}]})
         ));
         assert!(!cloudflare_duplicate(&json!({"errors":[{"code":10000}]})));
+    }
+
+    #[test]
+    fn dnspod_duplicate_is_idempotent() {
+        assert!(dnspod_add_success(&json!({"status":{"code":"1"}})));
+        assert!(dnspod_add_success(&json!({"status":{"code":"104"}})));
+        assert!(dnspod_add_success(&json!({"status":{"code":104}})));
+        assert!(!dnspod_add_success(&json!({"status":{"code":"17"}})));
     }
 
     #[test]

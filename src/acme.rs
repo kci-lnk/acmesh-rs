@@ -224,6 +224,7 @@ pub async fn issue(args: &Args, store: &Store) -> Result<()> {
         }
     }
     let thumb = crypto::thumbprint(&acme.key);
+    let serial_challenges = serial_dns_challenges(&provider);
     let mut records = Vec::new();
     let issuance_result: Result<()> = async {
         for auth in order["authorizations"]
@@ -240,6 +241,10 @@ pub async fn issue(args: &Args, store: &Store) -> Result<()> {
             let token = challenge["token"]
                 .as_str()
                 .context("challenge token missing")?;
+            let challenge_url = challenge["url"]
+                .as_str()
+                .context("challenge URL missing")?
+                .to_string();
             let domain = av["identifier"]["value"]
                 .as_str()
                 .context("authorization identifier missing")?;
@@ -249,17 +254,45 @@ pub async fn issue(args: &Args, store: &Store) -> Result<()> {
             dns.add_txt(&name, &value)
                 .await
                 .with_context(|| format!("add TXT {name}"))?;
-            records.push((
-                name,
-                value,
-                challenge["url"].as_str().unwrap_or_default().to_string(),
-            ));
+            records.push((name.clone(), value.clone(), challenge_url.clone()));
+            if serial_challenges {
+                println!("[dns] waiting {} seconds for propagation", args.dnssleep);
+                tokio::time::sleep(Duration::from_secs(args.dnssleep)).await;
+                println!("[acme] triggering DNS-01 validation for {domain}");
+                let _ = acme.signed(&challenge_url, &json!({})).await?;
+                let mut authorization_valid = false;
+                for _ in 0..40 {
+                    tokio::time::sleep(Duration::from_secs(3)).await;
+                    let authorization: Value =
+                        acme.signed(auth_url, &Value::Null).await?.json().await?;
+                    match authorization["status"].as_str() {
+                        Some("valid") => {
+                            authorization_valid = true;
+                            break;
+                        }
+                        Some("invalid") => {
+                            bail!("ACME authorization became invalid: {authorization}")
+                        }
+                        _ => {}
+                    }
+                }
+                if !authorization_valid {
+                    bail!("ACME authorization did not become valid for {domain}")
+                }
+                println!("[dns] removing TXT {name}");
+                dns.remove_txt(&name, &value)
+                    .await
+                    .with_context(|| format!("remove TXT {name}"))?;
+                records.pop();
+            }
         }
-        println!("[dns] waiting {} seconds for propagation", args.dnssleep);
-        tokio::time::sleep(Duration::from_secs(args.dnssleep)).await;
-        println!("[acme] triggering DNS-01 validation");
-        for (_, _, challenge_url) in &records {
-            let _ = acme.signed(challenge_url, &json!({})).await?;
+        if !serial_challenges {
+            println!("[dns] waiting {} seconds for propagation", args.dnssleep);
+            tokio::time::sleep(Duration::from_secs(args.dnssleep)).await;
+            println!("[acme] triggering DNS-01 validation");
+            for (_, _, challenge_url) in &records {
+                let _ = acme.signed(challenge_url, &json!({})).await?;
+            }
         }
         for _ in 0..40 {
             tokio::time::sleep(Duration::from_secs(3)).await;
@@ -340,11 +373,16 @@ pub async fn issue(args: &Args, store: &Store) -> Result<()> {
         Ok(())
     }
     .await;
+    let mut cleanup_errors = Vec::new();
     for (name, value, _) in records {
         println!("[dns] removing TXT {name}");
-        let _ = dns.remove_txt(&name, &value).await;
+        if let Err(error) = dns.remove_txt(&name, &value).await {
+            let message = format!("remove TXT {name}: {error:#}");
+            eprintln!("[dns] cleanup failed: {message}");
+            cleanup_errors.push(message);
+        }
     }
-    issuance_result
+    finish_issuance(issuance_result, cleanup_errors)
 }
 
 pub async fn renew(args: &Args, store: &Store) -> Result<()> {
@@ -443,6 +481,7 @@ fn is_provider_secret(key: &str) -> bool {
             | "CF_Email"
             | "DP_Id"
             | "DP_Key"
+            | "DP_Domain"
             | "Ali_Key"
             | "Ali_Secret"
             | "Ali_Domain"
@@ -461,11 +500,28 @@ fn is_provider_secret(key: &str) -> bool {
             | "PORKBUN_DOMAIN"
             | "BAIDU_ACCESS_KEY_ID"
             | "BAIDU_SECRET_ACCESS_KEY"
+            | "BAIDU_DOMAIN"
+            | "root_domain"
             | "Dynu_ClientId"
             | "Dynu_Secret"
             | "DYNV6_TOKEN"
             | "DuckDNS_Token"
     )
+}
+
+fn serial_dns_challenges(provider: &str) -> bool {
+    provider.eq_ignore_ascii_case("dns_duckdns")
+}
+
+fn finish_issuance(issuance_result: Result<()>, cleanup_errors: Vec<String>) -> Result<()> {
+    if cleanup_errors.is_empty() {
+        return issuance_result;
+    }
+    let cleanup = cleanup_errors.join("; ");
+    match issuance_result {
+        Ok(()) => bail!("certificate issuance completed, but DNS cleanup failed: {cleanup}"),
+        Err(error) => Err(error.context(format!("DNS cleanup also failed: {cleanup}"))),
+    }
 }
 fn csr_for(path: &Path, domains: &[String]) -> Result<Vec<u8>> {
     let kp = rcgen::KeyPair::from_pem(&fs::read_to_string(path)?)?;
@@ -514,6 +570,34 @@ fn eab_binding(key: &AccountKey, url: &str, kid: &str, encoded_key: &str) -> Res
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn persists_optional_dns_zone_configuration() {
+        assert!(is_provider_secret("DP_Domain"));
+        assert!(is_provider_secret("BAIDU_DOMAIN"));
+        assert!(is_provider_secret("root_domain"));
+    }
+
+    #[test]
+    fn duckdns_challenges_are_validated_serially() {
+        assert!(serial_dns_challenges("dns_duckdns"));
+        assert!(serial_dns_challenges("DNS_DUCKDNS"));
+        assert!(!serial_dns_challenges("dns_cf"));
+    }
+
+    #[test]
+    fn dns_cleanup_errors_are_returned_to_the_caller() {
+        let error = finish_issuance(Ok(()), vec!["remove TXT failed".into()]).unwrap_err();
+        assert!(error.to_string().contains("DNS cleanup failed"));
+
+        let error = finish_issuance(
+            Err(anyhow::anyhow!("issuance failed")),
+            vec!["remove TXT failed".into()],
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("DNS cleanup also failed"));
+        assert!(format!("{error:#}").contains("issuance failed"));
+    }
     use axum::{
         Json, Router,
         body::Bytes,

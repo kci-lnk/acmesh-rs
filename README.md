@@ -89,7 +89,7 @@ rust-acmesh issue -d example.com ...
 | 服务商 | `--dns` | 必需凭据 | 可选值 |
 | --- | --- | --- | --- |
 | 阿里云 DNS | `dns_ali` | `Ali_Key`, `Ali_Secret` | `Ali_Domain` |
-| 百度智能云 DNS | `dns_baiducloud` | `BAIDU_ACCESS_KEY_ID`, `BAIDU_SECRET_ACCESS_KEY` | `root_domain` |
+| 百度智能云 DNS | `dns_baiducloud` | `BAIDU_ACCESS_KEY_ID`, `BAIDU_SECRET_ACCESS_KEY` | `BAIDU_DOMAIN` 或 `root_domain` |
 | Cloudflare | `dns_cf` | `CF_Token`，或 `CF_Key` + `CF_Email` | `CF_Zone_ID`, `CF_Account_ID` |
 | DNSPod | `dns_dp` | `DP_Id`, `DP_Key` | `DP_Domain` |
 | 腾讯云 DNSPod | `dns_tencent` | `Tencent_SecretId`, `Tencent_SecretKey` | — |
@@ -97,10 +97,10 @@ rust-acmesh issue -d example.com ...
 | Dynu | `dns_dynu` | `Dynu_ClientId`, `Dynu_Secret` | — |
 | dynv6 | `dns_dynv6` | `DYNV6_TOKEN` | — |
 | GoDaddy | `dns_gd` | `GD_Key`, `GD_Secret` | `GD_Domain` |
-| 华为云 DNS | `dns_huaweicloud` | `HUAWEICLOUD_Username`, `HUAWEICLOUD_Password`, `HUAWEICLOUD_DomainName` | Region、ProjectName |
+| 华为云 DNS | `dns_huaweicloud` | `HUAWEICLOUD_Username`, `HUAWEICLOUD_Password`, `HUAWEICLOUD_DomainName` | `HUAWEICLOUD_Region`, `HUAWEICLOUD_ProjectName` |
 | Porkbun | `dns_porkbun` | `PORKBUN_API_KEY`, `PORKBUN_SECRET_API_KEY` | `PORKBUN_DOMAIN` |
 
-Cloudflare 和 DNSPod 在未显式提供 Zone 时会自动发现托管区域。若使用委派的 DNS-01 区域或特殊公共后缀，建议显式指定 Zone。
+支持 Zone 参数的服务商会优先使用显式配置，否则通过服务商 API 自动发现托管区域。若使用委派的 DNS-01 区域，建议显式指定 Zone 或 Zone ID。
 
 ### 证书文件与安装
 
