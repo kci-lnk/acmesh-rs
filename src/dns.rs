@@ -418,7 +418,14 @@ impl Dns {
             .get("Ali_Secret")
             .or_else(|| self.vars.get("access_key_secret"))
             .context("Ali_Secret is required")?;
-        let (root, rr) = root_sub(name, self.vars.get("Ali_Domain").map(String::as_str));
+        let (root, rr) = self
+            .alidns_root(
+                name,
+                self.vars.get("Ali_Domain").map(String::as_str),
+                id,
+                secret,
+            )
+            .await?;
         let mut common = vec![
             ("AccessKeyId", id.clone()),
             (
@@ -438,12 +445,12 @@ impl Dns {
             ("DomainName", root.clone()),
         ];
         if add {
-            common.push(("RR", rr));
-            common.push(("RRType", "TXT".into()));
+            common.push(("RR", rr.clone()));
+            common.push(("Type", "TXT".into()));
             common.push(("Value", value.into()));
         } else {
-            common.push(("RRKeyWord", rr));
-            common.push(("Type", "TXT".into()));
+            common.push(("RRKeyWord", rr.clone()));
+            common.push(("TypeKeyWord", "TXT".into()));
         }
         let v = self.ali_request(common, secret).await?;
         if add {
@@ -452,7 +459,11 @@ impl Dns {
             }
         } else if let Some(record) = v["DomainRecords"]["Record"]
             .as_array()
-            .and_then(|x| x.iter().find(|r| r["Value"] == value))
+            .and_then(|x| {
+                x.iter().find(|record| {
+                    record["RR"] == rr && record["Type"] == "TXT" && record["Value"] == value
+                })
+            })
             .and_then(|r| r["RecordId"].as_str())
         {
             let params = vec![
@@ -469,6 +480,47 @@ impl Dns {
             let _ = self.ali_request(params, secret).await?;
         }
         Ok(())
+    }
+    async fn alidns_root(
+        &self,
+        name: &str,
+        configured: Option<&str>,
+        id: &str,
+        secret: &str,
+    ) -> Result<(String, String)> {
+        if let Some(root) = configured {
+            let root = root.trim_end_matches('.').to_string();
+            let rr = ali_rr_for_root(name, &root)?;
+            return Ok((root, rr));
+        }
+
+        let name = name.trim_end_matches('.');
+        let labels = name.split('.').collect::<Vec<_>>();
+        let mut last_response = None;
+        for index in 0..labels.len() {
+            let root = labels[index..].join(".");
+            let params = vec![
+                ("AccessKeyId", id.to_string()),
+                ("Action", "DescribeDomainRecords".into()),
+                ("DomainName", root.clone()),
+                ("Format", "JSON".into()),
+                ("SignatureMethod", "HMAC-SHA1".into()),
+                ("SignatureNonce", uuid_nonce()),
+                ("SignatureVersion", "1.0".into()),
+                ("Timestamp", time_stamp()),
+                ("Version", "2015-01-09".into()),
+            ];
+            let (status, response) = self.ali_request_raw(params, secret).await?;
+            if status.is_success() && response.get("PageNumber").is_some() {
+                let rr = ali_rr_for_root(name, &root)?;
+                return Ok((root, rr));
+            }
+            last_response = Some(response);
+        }
+        bail!(
+            "AliDNS could not detect the root zone for {name}: {}",
+            last_response.unwrap_or(Value::Null)
+        )
     }
     async fn dynu(&self, add: bool, name: &str, value: &str) -> Result<()> {
         let id = self
@@ -859,35 +911,76 @@ impl Dns {
             .error_for_status()?;
         Ok(response.json().await?)
     }
-    async fn ali_request(&self, mut params: Vec<(&str, String)>, secret: &str) -> Result<Value> {
-        params.sort_by(|a, b| a.0.cmp(b.0));
-        let canonical = params
-            .iter()
-            .map(|(k, v)| format!("{}={}", enc(k), enc(v)))
-            .collect::<Vec<_>>()
-            .join("&");
-        let sign_src = format!("GET&%2F&{}", enc(&canonical));
-        let mut mac = Hmac::<Sha1>::new_from_slice(format!("{secret}&").as_bytes())?;
-        mac.update(sign_src.as_bytes());
-        let sig = STANDARD.encode(mac.finalize().into_bytes());
-        let mut q = canonical;
-        q.push_str("&Signature=");
-        q.push_str(&enc(&sig));
-        Ok(self
+    async fn ali_request(&self, params: Vec<(&str, String)>, secret: &str) -> Result<Value> {
+        let (status, value) = self.ali_request_raw(params, secret).await?;
+        if !status.is_success() || value.get("Code").is_some() {
+            bail!("AliDNS API request failed ({status}): {value}");
+        }
+        Ok(value)
+    }
+    async fn ali_request_raw(
+        &self,
+        params: Vec<(&str, String)>,
+        secret: &str,
+    ) -> Result<(reqwest::StatusCode, Value)> {
+        let query = ali_signed_query(params, secret)?;
+        let response = self
             .client
-            .get("https://alidns.aliyuncs.com/")
-            .query(
-                &q.split('&')
-                    .filter_map(|p| p.split_once('='))
-                    .collect::<Vec<_>>(),
-            )
+            .get(format!("https://alidns.aliyuncs.com/?{query}"))
             .send()
-            .await?
-            .error_for_status()?
-            .json()
-            .await?)
+            .await?;
+        let status = response.status();
+        let body = response.text().await?;
+        let value = serde_json::from_str(&body)
+            .with_context(|| format!("AliDNS returned non-JSON response ({status}): {body}"))?;
+        Ok((status, value))
     }
 }
+
+fn ali_signed_query(mut params: Vec<(&str, String)>, secret: &str) -> Result<String> {
+    params.sort_by(|a, b| a.0.cmp(b.0));
+    let canonical = params
+        .iter()
+        .map(|(key, value)| format!("{}={}", ali_percent_encode(key), ali_percent_encode(value)))
+        .collect::<Vec<_>>()
+        .join("&");
+    let string_to_sign = format!("GET&%2F&{}", ali_percent_encode(&canonical));
+    let mut mac = Hmac::<Sha1>::new_from_slice(format!("{secret}&").as_bytes())?;
+    mac.update(string_to_sign.as_bytes());
+    let signature = STANDARD.encode(mac.finalize().into_bytes());
+    Ok(format!(
+        "Signature={}&{canonical}",
+        ali_percent_encode(&signature)
+    ))
+}
+
+fn ali_percent_encode(value: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut encoded = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
+            encoded.push(char::from(byte));
+        } else {
+            encoded.push('%');
+            encoded.push(char::from(HEX[usize::from(byte >> 4)]));
+            encoded.push(char::from(HEX[usize::from(byte & 0x0f)]));
+        }
+    }
+    encoded
+}
+
+fn ali_rr_for_root(name: &str, root: &str) -> Result<String> {
+    let name = name.trim_end_matches('.');
+    let root = root.trim_end_matches('.');
+    if name == root {
+        return Ok("@".into());
+    }
+    name.strip_suffix(&format!(".{root}"))
+        .filter(|rr| !rr.is_empty())
+        .map(str::to_string)
+        .with_context(|| format!("{name} is not inside AliDNS zone {root}"))
+}
+
 fn root_sub(name: &str, configured: Option<&str>) -> (String, String) {
     let clean = name.strip_prefix("_acme-challenge.").unwrap_or(name);
     let root = configured.map(str::to_string).unwrap_or_else(|| {
@@ -924,13 +1017,11 @@ fn uuid_nonce() -> String {
     hex(&bytes)
 }
 fn time_stamp() -> String {
-    format!(
-        "{}Z",
-        time::OffsetDateTime::now_utc()
-            .format(&time::format_description::well_known::Rfc3339)
-            .unwrap()
-            .trim_end_matches('Z')
-    )
+    time::OffsetDateTime::now_utc()
+        .replace_nanosecond(0)
+        .expect("zero is a valid nanosecond")
+        .format(&time::format_description::well_known::Rfc3339)
+        .expect("UTC timestamps are valid RFC 3339")
 }
 fn hmac256(key: &[u8], data: &[u8]) -> Result<Vec<u8>> {
     let mut mac = Hmac::<Sha2>::new_from_slice(key)?;
@@ -1001,6 +1092,69 @@ mod tests {
         let (root, sub) = root_sub("_acme-challenge.example.com", None);
         assert_eq!(root, "example.com");
         assert_eq!(sub, "@");
+    }
+
+    #[test]
+    fn alidns_rr_preserves_acme_challenge_label() {
+        assert_eq!(
+            ali_rr_for_root("_acme-challenge.example.com", "example.com").unwrap(),
+            "_acme-challenge"
+        );
+        assert_eq!(
+            ali_rr_for_root("_acme-challenge.www.example.com", "example.com").unwrap(),
+            "_acme-challenge.www"
+        );
+        assert_eq!(
+            ali_rr_for_root("_acme-challenge.api.example.com.cn.", "example.com.cn.").unwrap(),
+            "_acme-challenge.api"
+        );
+    }
+
+    #[test]
+    fn alidns_rr_rejects_names_outside_configured_zone() {
+        let error = ali_rr_for_root("_acme-challenge.example.net", "example.com").unwrap_err();
+        assert!(error.to_string().contains("is not inside AliDNS zone"));
+    }
+
+    #[test]
+    fn alidns_percent_encoding_follows_rpc_rules() {
+        assert_eq!(ali_percent_encode(" ~*+/="), "%20~%2A%2B%2F%3D");
+        assert_eq!(ali_percent_encode("中文"), "%E4%B8%AD%E6%96%87");
+    }
+
+    #[test]
+    fn alidns_signed_query_is_encoded_once() {
+        let query = ali_signed_query(
+            vec![
+                ("AccessKeyId", "testid".into()),
+                ("Action", "AddDomainRecord".into()),
+                ("DomainName", "example.com".into()),
+                ("RR", "_acme-challenge".into()),
+                ("SignatureMethod", "HMAC-SHA1".into()),
+                ("SignatureNonce", "nonce".into()),
+                ("SignatureVersion", "1.0".into()),
+                ("Timestamp", "2026-07-15T12:34:56Z".into()),
+                ("Type", "TXT".into()),
+                ("Value", "challenge_value".into()),
+                ("Version", "2015-01-09".into()),
+            ],
+            "testsecret",
+        )
+        .unwrap();
+        assert!(query.starts_with("Signature=lKVTcVnLaOBC356S%2FE4FVKhUOYQ%3D&AccessKeyId=testid"));
+        assert!(query.contains("Timestamp=2026-07-15T12%3A34%3A56Z"));
+        assert!(query.contains("RR=_acme-challenge"));
+        assert!(query.contains("Type=TXT"));
+        assert!(!query.contains("%253A"));
+        assert!(!query.contains("RRType"));
+    }
+
+    #[test]
+    fn alidns_timestamp_has_second_precision() {
+        let timestamp = time_stamp();
+        assert_eq!(timestamp.len(), 20);
+        assert!(timestamp.ends_with('Z'));
+        assert!(!timestamp.contains('.'));
     }
 
     #[test]
