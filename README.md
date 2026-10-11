@@ -99,8 +99,20 @@ rust-acmesh issue -d example.com ...
 | GoDaddy | `dns_gd` | `GD_Key`, `GD_Secret` | `GD_Domain` |
 | 华为云 DNS | `dns_huaweicloud` | `HUAWEICLOUD_Username`, `HUAWEICLOUD_Password`, `HUAWEICLOUD_DomainName` | `HUAWEICLOUD_Region`, `HUAWEICLOUD_ProjectName` |
 | Porkbun | `dns_porkbun` | `PORKBUN_API_KEY`, `PORKBUN_SECRET_API_KEY` | `PORKBUN_DOMAIN` |
+| 西部数码 West.cn | `dns_west_cn` | `WEST_Username`, `WEST_Key`（API 明文密钥的 MD5 值） | — |
 
 支持 Zone 参数的服务商会优先使用显式配置，否则通过服务商 API 自动发现托管区域。若使用委派的 DNS-01 区域，建议显式指定 Zone 或 Zone ID。
+
+西部数码使用与 [acme.sh 上游插件](https://github.com/acmesh-official/acme.sh/blob/master/dnsapi/dns_west_cn.sh) 相同的账号级凭据。请在 [API 接口设置](https://www.west.cn/manager/API/APIconfig.asp) 获取或设置 API 明文密钥，在本地计算其 MD5 值后填入 `WEST_Key`；程序会直接使用该值，不会再次计算 MD5。请同时确认 API 允许访问的 IP 包含运行客户端的出口 IP，具体参见[官方说明](https://gd.west.cn/faq/list.asp?unid=2590)。
+
+```bash
+export WEST_Username='your-west-username'
+export WEST_Key='MD5_OF_YOUR_API_PASSWORD'
+rust-acmesh --issue --server letsencrypt --dns dns_west_cn \
+  -d example.com -d '*.example.com'
+```
+
+也可重复使用 `--env WEST_Username=... --env WEST_Key=...` 传入凭据。默认保存凭据供续期复用；指定 `--no-save-credentials` 可禁止保存，此时续期需重新提供凭据。西部数码直接接收完整挑战域名，无需额外配置 Zone。
 
 ### 证书文件与安装
 
@@ -221,6 +233,17 @@ rust-acmesh issue -d example.com ...
 ```
 
 The supported DNS providers and credential names are listed in the [Chinese provider table](#dns-服务商) above. They are identical on every platform.
+
+For West.cn, use the account-level credentials supported by [acme.sh](https://github.com/acmesh-official/acme.sh/blob/master/dnsapi/dns_west_cn.sh). Obtain or set your API password in [API settings](https://www.west.cn/manager/API/APIconfig.asp), compute its MD5 locally, and supply that digest as `WEST_Key`. The client sends the digest unchanged. Ensure the API IP allowlist includes the client's outbound IP; see the [official instructions](https://gd.west.cn/faq/list.asp?unid=2590).
+
+```bash
+export WEST_Username='your-west-username'
+export WEST_Key='MD5_OF_YOUR_API_PASSWORD'
+rust-acmesh --issue --server letsencrypt --dns dns_west_cn \
+  -d example.com -d '*.example.com'
+```
+
+Repeated `--env WEST_Username=... --env WEST_Key=...` arguments are also supported. Credentials are saved for renewal unless `--no-save-credentials` is set; when disabled, provide them again at renewal. West.cn receives the full challenge hostname and requires no zone override.
 
 ### Certificate installation and renewal
 

@@ -8,6 +8,11 @@ use sha1::Sha1;
 use sha2::Sha256 as Sha2;
 use std::{collections::HashMap, time::Duration};
 
+const WEST_CN_API: &str = "https://api.west.cn/API/v2/domain/dns/";
+
+#[cfg(test)]
+mod west_cn_tests;
+
 #[derive(Clone)]
 pub struct Dns {
     client: Client,
@@ -15,12 +20,33 @@ pub struct Dns {
     vars: HashMap<String, String>,
 }
 impl Dns {
+    pub(crate) fn validate_credentials(
+        provider: &str,
+        vars: &HashMap<String, String>,
+    ) -> Result<()> {
+        if provider.eq_ignore_ascii_case("dns_west_cn") {
+            for key in ["WEST_Username", "WEST_Key"] {
+                if vars.get(key).is_none_or(|value| value.trim().is_empty()) {
+                    bail!(
+                        "{key} is required for West.cn (WEST_Key must be the MD5 of the API password)"
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub fn new(provider: &str, vars: HashMap<String, String>, insecure: bool) -> Result<Self> {
+        Self::validate_credentials(provider, &vars)?;
         crate::crypto::init_tls();
-        let client = Client::builder()
+        let mut builder = Client::builder()
             .danger_accept_invalid_certs(insecure)
-            .timeout(Duration::from_secs(30))
-            .build()?;
+            .timeout(Duration::from_secs(30));
+        if provider.eq_ignore_ascii_case("dns_west_cn") {
+            // 307/308 redirects would forward account credentials in the form body.
+            builder = builder.redirect(reqwest::redirect::Policy::none());
+        }
+        let client = builder.build()?;
         Ok(Self {
             client,
             provider: provider.to_ascii_lowercase(),
@@ -51,11 +77,177 @@ impl Dns {
                 "dns_noip is a dynamic-IP service and does not expose DNS-01 TXT record management"
             ),
             "dns_huaweicloud" => self.huaweicloud(add, name, value).await,
+            "dns_west_cn" => self.west_cn(add, name, value, WEST_CN_API).await,
             _ => bail!(
-                "unsupported DNS provider {}; supported: dns_ali,dns_baiducloud,dns_cf,dns_dp,dns_duckdns,dns_dynu,dns_dynv6,dns_gd,dns_huaweicloud,dns_porkbun,dns_tencent",
+                "unsupported DNS provider {}; supported: dns_ali,dns_baiducloud,dns_cf,dns_dp,dns_duckdns,dns_dynu,dns_dynv6,dns_gd,dns_huaweicloud,dns_porkbun,dns_tencent,dns_west_cn",
                 self.provider
             ),
         }
+    }
+    // The endpoint is internal so tests can exercise the protocol on a local server.
+    async fn west_cn(&self, add: bool, name: &str, value: &str, endpoint: &str) -> Result<()> {
+        if add {
+            self.west_cn_request(
+                endpoint,
+                "dnsrec.add",
+                name,
+                &[
+                    ("record_type", "TXT".into()),
+                    ("record_value", value.into()),
+                ],
+            )
+            .await?;
+            return Ok(());
+        }
+
+        // Collect IDs before deleting: removals can shift records between pages.
+        let mut ids = Vec::new();
+        let mut page = 1;
+        let mut received = 0;
+        let mut seen_ids = std::collections::HashSet::new();
+        loop {
+            let Some(response) = self
+                .west_cn_request(
+                    endpoint,
+                    "dnsrec.list",
+                    name,
+                    &[
+                        ("record_type", "TXT".into()),
+                        ("limit", "100".into()),
+                        ("pageno", page.to_string()),
+                    ],
+                )
+                .await?
+            else {
+                break;
+            };
+            let body = &response["body"];
+            let items = body["items"]
+                .as_array()
+                .context("West.cn dnsrec.list response has no record array")?;
+            received += items.len() as u64;
+            if let Some(current) = west_cn_page_number(body, "pageno")?
+                && current != page
+            {
+                bail!("West.cn dnsrec.list returned an unexpected page");
+            }
+            let previous_count = seen_ids.len();
+            for record in items {
+                let record_type = record["record_type"]
+                    .as_str()
+                    .context("West.cn record has no record_type")?;
+                let record_value = record["record_value"]
+                    .as_str()
+                    .context("West.cn record has no record_value")?;
+                let hostname = record["hostname"]
+                    .as_str()
+                    .context("West.cn record has no hostname")?;
+                // The API filters by full hostname but may return a relative hostname.
+                let hostname = hostname.trim_end_matches('.').to_ascii_lowercase();
+                let expected = name.trim_end_matches('.').to_ascii_lowercase();
+                let id = json_id(record.get("record_id"))
+                    .filter(|id| !id.is_empty() && id.bytes().all(|byte| byte.is_ascii_digit()))
+                    .and_then(|id| id.parse::<u64>().ok())
+                    .filter(|id| *id > 0)
+                    .context("West.cn record has no valid record_id")?
+                    .to_string();
+                seen_ids.insert(id.clone());
+                if record_type.eq_ignore_ascii_case("TXT")
+                    && record_value == value
+                    && !hostname.is_empty()
+                    && (hostname == expected || expected.starts_with(&format!("{hostname}.")))
+                    && !ids.contains(&id)
+                {
+                    ids.push(id);
+                }
+            }
+            if !items.is_empty() && seen_ids.len() == previous_count {
+                bail!("West.cn dnsrec.list pagination did not advance");
+            }
+            let more = if let Some(last) = west_cn_page_number(body, "pagecount")? {
+                if last < page && !items.is_empty() {
+                    bail!("West.cn dnsrec.list returned an invalid pagecount");
+                }
+                page < last
+            } else if let Some(total) = west_cn_page_number(body, "total")? {
+                received < total
+            } else {
+                // Without metadata the server may cap pages below the requested limit.
+                !items.is_empty()
+            };
+            if !more {
+                break;
+            }
+            if items.is_empty() || page >= 1000 {
+                bail!("West.cn dnsrec.list pagination did not complete");
+            }
+            page += 1;
+        }
+        let mut errors = Vec::new();
+        for id in ids {
+            if let Err(error) = self
+                .west_cn_request(endpoint, "dnsrec.remove", name, &[("record_id", id)])
+                .await
+            {
+                errors.push(format!("{error:#}"));
+            }
+        }
+        if !errors.is_empty() {
+            bail!("West.cn TXT cleanup failed: {}", errors.join("; "));
+        }
+        Ok(())
+    }
+
+    async fn west_cn_request(
+        &self,
+        endpoint: &str,
+        action: &str,
+        name: &str,
+        extra: &[(&str, String)],
+    ) -> Result<Option<Value>> {
+        Self::validate_credentials("dns_west_cn", &self.vars)?;
+        let username = &self.vars["WEST_Username"];
+        let key = &self.vars["WEST_Key"];
+        let mut form = vec![
+            ("act", action.to_string()),
+            ("username", username.clone()),
+            ("apikey", key.clone()),
+            ("domain", name.to_string()),
+            ("hostname", name.to_string()),
+        ];
+        form.extend_from_slice(extra);
+        let response = self
+            .client
+            .post(endpoint)
+            .form(&form)
+            .send()
+            .await
+            .with_context(|| format!("West.cn {action} request failed"))?;
+        if !response.status().is_success() {
+            bail!("West.cn {action} HTTP error ({})", response.status());
+        }
+        let response: Value = response
+            .json()
+            .await
+            .with_context(|| format!("West.cn {action} returned invalid JSON"))?;
+        let code = json_id(response.get("code"))
+            .and_then(|code| code.parse::<u64>().ok())
+            .with_context(|| format!("West.cn {action} response has no valid API code"))?;
+        if action == "dnsrec.list"
+            && matches!(code, 200 | 500)
+            && response["msg"]
+                .as_str()
+                .is_some_and(|msg| msg.trim().eq_ignore_ascii_case("no records"))
+        {
+            return Ok(None);
+        }
+        if code != 200 {
+            // Do not print the body/message: an API error may echo credentials.
+            bail!(
+                "West.cn {action} failed (API code {code}); check WEST_Username, MD5 WEST_Key, API access IP settings and domain permissions"
+            );
+        }
+        Ok(Some(response))
     }
     async fn cloudflare(&self, add: bool, name: &str, value: &str) -> Result<()> {
         let token = self
@@ -1285,6 +1477,16 @@ fn duckdns_domain(name: &str) -> Result<String> {
 
 fn value_array<'a>(value: &'a Value, key: &str) -> Option<&'a Vec<Value>> {
     value.as_array().or_else(|| value[key].as_array())
+}
+
+fn west_cn_page_number(body: &Value, field: &str) -> Result<Option<u64>> {
+    body.get(field)
+        .map(|value| {
+            json_id(Some(value))
+                .and_then(|value| value.parse().ok())
+                .with_context(|| format!("West.cn dnsrec.list has invalid {field}"))
+        })
+        .transpose()
 }
 
 fn json_id(value: Option<&Value>) -> Option<String> {

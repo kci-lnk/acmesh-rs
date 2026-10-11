@@ -215,6 +215,13 @@ pub fn one_domain(args: &Args) -> Result<String> {
         .ok_or_else(|| anyhow::anyhow!("-d/--domain is required"))
 }
 pub fn credentials(args: &Args) -> HashMap<String, String> {
+    credentials_from(args, |name| std::env::var(name).ok())
+}
+
+fn credentials_from(
+    args: &Args,
+    mut env_var: impl FnMut(&str) -> Option<String>,
+) -> HashMap<String, String> {
     let mut out: HashMap<String, String> = args.env.iter().cloned().collect();
     let names = [
         "CF_Token",
@@ -249,6 +256,8 @@ pub fn credentials(args: &Args) -> HashMap<String, String> {
         "Dynu_Secret",
         "DYNV6_TOKEN",
         "DuckDNS_Token",
+        "WEST_Username",
+        "WEST_Key",
         "NOIP_USERNAME",
         "NOIP_PASSWORD",
         "EAB_KID",
@@ -256,7 +265,7 @@ pub fn credentials(args: &Args) -> HashMap<String, String> {
     ];
     for name in names {
         if !out.contains_key(name)
-            && let Ok(value) = std::env::var(name)
+            && let Some(value) = env_var(name)
         {
             out.insert(name.into(), value);
         }
@@ -267,6 +276,25 @@ pub fn credentials(args: &Args) -> HashMap<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn west_credentials_read_environment_and_prefer_explicit_values() {
+        let environment = |name: &str| match name {
+            "WEST_Username" => Some("environment-user".into()),
+            "WEST_Key" => Some("environment-md5-key".into()),
+            _ => None,
+        };
+        let mut args =
+            Args::try_parse_from(["rust-acmesh", "issue", "--dns", "dns_west_cn"]).unwrap();
+        let credentials = credentials_from(&args, environment);
+        assert_eq!(credentials["WEST_Username"], "environment-user");
+        assert_eq!(credentials["WEST_Key"], "environment-md5-key");
+        args.env
+            .push(("WEST_Key".into(), "explicit-md5-key".into()));
+        let credentials = credentials_from(&args, environment);
+        assert_eq!(credentials["WEST_Username"], "environment-user");
+        assert_eq!(credentials["WEST_Key"], "explicit-md5-key");
+    }
 
     #[test]
     fn translates_acmesh_operation_flags() {

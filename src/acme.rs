@@ -207,22 +207,13 @@ pub async fn issue(args: &Args, store: &Store) -> Result<()> {
         .to_string();
     let mut order: Value = order_response.json().await?;
     order["url"] = json!(order_url);
-    let mut credentials = crate::config::read_kv(&store.account_conf())?;
-    credentials.extend(cli::credentials(args));
-    let dns = Dns::new(&provider, credentials.clone(), args.insecure)?;
-    if !args.no_save_credentials {
-        let mut conf = crate::config::read_kv(&store.account_conf())?;
-        let mut changed = false;
-        for (key, value) in &credentials {
-            if is_provider_secret(key) && conf.get(key) != Some(value) {
-                conf.insert(key.clone(), value.clone());
-                changed = true;
-            }
-        }
-        if changed {
-            crate::config::write_kv(&store.account_conf(), &conf)?;
-        }
-    }
+    let credentials = provider_credentials(
+        store,
+        &provider,
+        cli::credentials(args),
+        !args.no_save_credentials,
+    )?;
+    let dns = Dns::new(&provider, credentials, args.insecure)?;
     let thumb = crypto::thumbprint(&acme.key);
     let serial_challenges = serial_dns_challenges(&provider);
     let mut records = Vec::new();
@@ -471,6 +462,31 @@ fn server_url(requested: Option<&str>, staging: bool, saved: Option<&str>) -> St
         None => ZERO.into(),
     }
 }
+fn provider_credentials(
+    store: &Store,
+    provider: &str,
+    overrides: std::collections::HashMap<String, String>,
+    save: bool,
+) -> Result<std::collections::HashMap<String, String>> {
+    let mut conf = crate::config::read_kv(&store.account_conf())?;
+    let mut credentials = conf.clone();
+    credentials.extend(overrides);
+    Dns::validate_credentials(provider, &credentials)?;
+    if save {
+        let mut changed = false;
+        for (key, value) in &credentials {
+            if is_provider_secret(key) && conf.get(key) != Some(value) {
+                conf.insert(key.clone(), value.clone());
+                changed = true;
+            }
+        }
+        if changed {
+            crate::config::write_kv(&store.account_conf(), &conf)?;
+        }
+    }
+    Ok(credentials)
+}
+
 fn is_provider_secret(key: &str) -> bool {
     matches!(
         key,
@@ -506,6 +522,8 @@ fn is_provider_secret(key: &str) -> bool {
             | "Dynu_Secret"
             | "DYNV6_TOKEN"
             | "DuckDNS_Token"
+            | "WEST_Username"
+            | "WEST_Key"
     )
 }
 
@@ -570,6 +588,75 @@ fn eab_binding(key: &AccountKey, url: &str, kid: &str, encoded_key: &str) -> Res
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn west_credentials_persist_and_reload_for_renewal() {
+        let home = std::env::temp_dir().join(format!("rust-acmesh-west-{}", uuid::Uuid::new_v4()));
+        let store = Store::new(Some(home.clone()), None, None, None, None).unwrap();
+        let mut args = Args::try_parse_from([
+            "rust-acmesh",
+            "issue",
+            "--dns",
+            "dns_west_cn",
+            "--env",
+            "WEST_Username=test-user",
+            "--env",
+            "WEST_Key=md5-key",
+        ])
+        .unwrap();
+        let overrides = args.env.iter().cloned().collect();
+        let credentials =
+            provider_credentials(&store, "dns_west_cn", overrides, !args.no_save_credentials)
+                .unwrap();
+        assert_eq!(credentials["WEST_Key"], "md5-key");
+        let saved = crate::config::read_kv(&store.account_conf()).unwrap();
+        assert_eq!(saved["WEST_Username"], "test-user");
+        assert_eq!(saved["WEST_Key"], "md5-key");
+        let reloaded =
+            provider_credentials(&store, "dns_west_cn", Default::default(), true).unwrap();
+        assert_eq!(reloaded, saved);
+
+        args.no_save_credentials = true;
+        let updated = provider_credentials(
+            &store,
+            "dns_west_cn",
+            [("WEST_Key".into(), "replacement-key".into())].into(),
+            !args.no_save_credentials,
+        )
+        .unwrap();
+        assert_eq!(updated["WEST_Key"], "replacement-key");
+        assert_eq!(
+            crate::config::read_kv(&store.account_conf()).unwrap(),
+            saved
+        );
+        std::fs::remove_file(store.account_conf()).unwrap();
+        provider_credentials(&store, "dns_west_cn", saved, !args.no_save_credentials).unwrap();
+        assert!(!store.account_conf().exists());
+        std::fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn audit_empty_west_credentials_do_not_overwrite_saved_credentials() {
+        let home =
+            std::env::temp_dir().join(format!("rust-acmesh-west-audit-{}", uuid::Uuid::new_v4()));
+        let store = Store::new(Some(home.clone()), None, None, None, None).unwrap();
+        let saved = [
+            ("WEST_Username".into(), "user".into()),
+            ("WEST_Key".into(), "valid-key".into()),
+        ]
+        .into();
+        crate::config::write_kv(&store.account_conf(), &saved).unwrap();
+        let result = provider_credentials(
+            &store,
+            "dns_west_cn",
+            [("WEST_Key".into(), "".into())].into(),
+            true,
+        );
+        let actual = crate::config::read_kv(&store.account_conf()).unwrap();
+        std::fs::remove_dir_all(home).unwrap();
+        assert!(result.is_err());
+        assert_eq!(actual, saved);
+    }
 
     #[test]
     fn persists_optional_dns_zone_configuration() {
