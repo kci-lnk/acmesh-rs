@@ -203,6 +203,59 @@ async fn dnshe_add_and_remove_are_idempotent_and_only_touch_matching_txt() {
 }
 
 #[tokio::test]
+async fn dnshe_does_not_delete_a_fqdn_that_equals_the_relative_challenge_name() {
+    let name = format!("{NAME}.nested.example.net");
+    let server = Server::new(vec![
+        zone(),
+        records(vec![
+            record(ROOT_ID, NAME, "TXT", "root-token"),
+            record(WILDCARD_ID, &name, "TXT", "root-token"),
+        ]),
+        reply(json!({"success":true})),
+    ])
+    .await;
+    dns()
+        .dnshe(false, &name, "root-token", &server.url)
+        .await
+        .unwrap();
+    let calls = server.calls.lock().unwrap();
+    assert_eq!(calls.len(), 3);
+    assert_eq!(
+        serde_json::from_slice::<Value>(&calls[2].body).unwrap(),
+        json!({"id":WILDCARD_ID})
+    );
+    assert!(!record_matches_name(
+        "_acme-challenge.",
+        "nested.example.net",
+        NAME
+    ));
+}
+
+#[tokio::test]
+async fn dnshe_reconciles_an_uncertain_create_without_replaying_it() {
+    for created in [true, false] {
+        let server = Server::new(vec![
+            zone(),
+            records(vec![]),
+            (StatusCode::BAD_GATEWAY, "upstream response lost".into()),
+            records(if created {
+                vec![record(ROOT_ID, NAME, "TXT", "root-token")]
+            } else {
+                vec![]
+            }),
+        ])
+        .await;
+        let result = dns().dnshe(true, NAME, "root-token", &server.url).await;
+        assert_eq!(result.is_ok(), created);
+        let calls = server.calls.lock().unwrap();
+        assert_eq!(calls.len(), 4);
+        assert_eq!(calls[2].query["action"], "create");
+        assert_eq!(calls[3].query["action"], "list");
+        assert_eq!(calls[3].method, Method::GET);
+    }
+}
+
+#[tokio::test]
 async fn dnshe_refuses_inactive_or_invalid_responses_and_redacts_errors() {
     for (replies, expected) in [
         (

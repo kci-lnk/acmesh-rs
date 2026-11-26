@@ -225,6 +225,13 @@ pub async fn issue(args: &Args, store: &Store) -> Result<()> {
         {
             let auth_url = auth.as_str().context("invalid authorization URL")?;
             let av: Value = acme.signed(auth_url, &Value::Null).await?.json().await?;
+            match av["status"].as_str() {
+                Some("valid") => continue,
+                Some(status @ ("invalid" | "deactivated" | "expired" | "revoked")) => {
+                    bail!("ACME authorization is {status}")
+                }
+                _ => {}
+            }
             let challenge = av["challenges"]
                 .as_array()
                 .and_then(|x| x.iter().find(|x| x["type"] == "dns-01"))
@@ -277,7 +284,7 @@ pub async fn issue(args: &Args, store: &Store) -> Result<()> {
                 records.pop();
             }
         }
-        if !serial_challenges {
+        if !serial_challenges && !records.is_empty() {
             println!("[dns] waiting {} seconds for propagation", args.dnssleep);
             tokio::time::sleep(Duration::from_secs(args.dnssleep)).await;
             println!("[acme] triggering DNS-01 validation");
@@ -855,10 +862,11 @@ mod tests {
             .route("/directory", get(move || { let origin=directory_origin.clone(); async move { Json(json!({"newNonce":format!("{origin}/nonce"),"newAccount":format!("{origin}/account"),"newOrder":format!("{origin}/order"),"revokeCert":format!("{origin}/revoke")})) } }))
             .route("/nonce", head(|| async { [(HeaderName::from_static("replay-nonce"), HeaderValue::from_static("test-nonce"))] }))
             .route("/account", post(move || { let origin=account_origin.clone(); async move { (StatusCode::CREATED, [(HeaderName::from_static("location"), HeaderValue::from_str(&format!("{origin}/account/1")).unwrap())], Json(json!({"status":"valid"}))) } }))
-            .route("/order", post(move || { let origin=order_origin.clone(); async move { (StatusCode::CREATED, [(HeaderName::from_static("location"), HeaderValue::from_str(&format!("{origin}/order/1")).unwrap())], Json(json!({"status":"pending","authorizations":[format!("{origin}/auth/1"),format!("{origin}/auth/2")],"finalize":format!("{origin}/finalize/1")}))) } }))
+            .route("/order", post(move || { let origin=order_origin.clone(); async move { (StatusCode::CREATED, [(HeaderName::from_static("location"), HeaderValue::from_str(&format!("{origin}/order/1")).unwrap())], Json(json!({"status":"pending","authorizations":[format!("{origin}/auth/1"),format!("{origin}/auth/2"),format!("{origin}/auth/reused")],"finalize":format!("{origin}/finalize/1")}))) } }))
             .route("/order/1", post(move || { let origin=order_poll_origin.clone(); async move { Json(json!({"status":"ready","finalize":format!("{origin}/finalize/1")})) } }))
             .route("/auth/1", post(move || { let origin=auth_origin.clone(); async move { Json(json!({"identifier":{"type":"dns","value":"example.com"},"challenges":[{"type":"dns-01","token":"challenge-token","url":format!("{origin}/challenge/1")}]})) } }))
             .route("/auth/2", post(move || { let origin=wildcard_auth_origin.clone(); async move { Json(json!({"identifier":{"type":"dns","value":"example.com"},"wildcard":true,"challenges":[{"type":"dns-01","token":"wildcard-challenge-token","url":format!("{origin}/challenge/2")}]})) } }))
+            .route("/auth/reused", post(|| async { Json(json!({"identifier":{"type":"dns","value":"reused.example.com"},"status":"valid","challenges":[]})) }))
             .route("/challenge/1", post(|| async { Json(json!({"status":"pending"})) }))
             .route("/challenge/2", post(|| async { Json(json!({"status":"pending"})) }))
             .route("/finalize/1", post(move || { let origin=finalize_origin.clone(); async move { Json(json!({"status":"valid","certificate":format!("{origin}/cert/1")})) } }))
@@ -880,6 +888,8 @@ mod tests {
             "example.com",
             "-d",
             "*.example.com",
+            "-d",
+            "reused.example.com",
             "--home",
             home.to_str().unwrap(),
         ])
@@ -894,7 +904,7 @@ mod tests {
         );
         assert_eq!(
             crate::config::read_kv(&store.domain_conf("example.com")).unwrap()["Le_Alt"],
-            "example.com,*.example.com"
+            "example.com,*.example.com,reused.example.com"
         );
         server.abort();
     }

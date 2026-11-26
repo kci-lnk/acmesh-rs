@@ -1,5 +1,6 @@
 use super::*;
 use reqwest::{StatusCode, header::HeaderValue};
+use std::collections::BTreeSet;
 
 #[cfg(test)]
 mod tests;
@@ -26,52 +27,31 @@ impl Dns {
         let name = dns_name(name);
         let (zone, zone_id) = self.dnshe_zone(api, &name).await?;
         let relative = relative_name(&name, &zone).context("challenge is outside DNSHE zone")?;
-        let reply = self
-            .dnshe_request(
-                api,
-                "dns_records",
-                "list",
-                &[("subdomain_id", zone_id.to_string())],
-                None,
-            )
+        let matched_ids = self
+            .dnshe_record_ids(api, zone_id, &zone, &name, value)
             .await?;
-        let records = reply["records"]
-            .as_array()
-            .context("DNSHE response has no record array")?;
-        let mut matched_ids = std::collections::BTreeSet::new();
-        for record in records {
-            if record["type"]
-                .as_str()
-                .is_some_and(|kind| kind.eq_ignore_ascii_case("TXT"))
-                && record["name"].as_str().is_some_and(|record_name| {
-                    let record_name = dns_name(record_name);
-                    record_name == name
-                        || record_name == relative
-                        || (record_name.is_empty() && relative == "@")
-                })
-                && record["content"].as_str().is_some_and(|content| {
-                    content == value
-                        || content.strip_prefix('"').and_then(|s| s.strip_suffix('"'))
-                            == Some(value)
-                })
-            {
-                matched_ids.insert(
-                    positive_id(&record["id"]).context("DNSHE TXT record has no valid id")?,
-                );
-            }
-        }
 
         if add && matched_ids.is_empty() {
-            self.dnshe_request(
-                api,
-                "dns_records",
-                "create",
-                &[],
-                Some(json!({
-                    "subdomain_id": zone_id, "type": "TXT", "name": relative, "content": value,
-                })),
-            )
-            .await?;
+            let result = self
+                .dnshe_request(
+                    api,
+                    "dns_records",
+                    "create",
+                    &[],
+                    Some(json!({
+                        "subdomain_id": zone_id, "type": "TXT", "name": relative, "content": value,
+                    })),
+                )
+                .await;
+            // A failed response can follow a successful create. Reconcile once without replaying the write.
+            if let Err(error) = result
+                && !self
+                    .dnshe_record_ids(api, zone_id, &zone, &name, value)
+                    .await
+                    .is_ok_and(|ids| !ids.is_empty())
+            {
+                return Err(error);
+            }
         } else if !add {
             let mut failures = Vec::new();
             for id in matched_ids {
@@ -89,6 +69,49 @@ impl Dns {
             );
         }
         Ok(())
+    }
+
+    async fn dnshe_record_ids(
+        &self,
+        api: &str,
+        zone_id: u64,
+        zone: &str,
+        name: &str,
+        value: &str,
+    ) -> Result<BTreeSet<u64>> {
+        let reply = self
+            .dnshe_request(
+                api,
+                "dns_records",
+                "list",
+                &[("subdomain_id", zone_id.to_string())],
+                None,
+            )
+            .await?;
+        let records = reply["records"]
+            .as_array()
+            .context("DNSHE response has no record array")?;
+        let mut matched_ids = BTreeSet::new();
+        for record in records {
+            if record["type"]
+                .as_str()
+                .is_some_and(|kind| kind.eq_ignore_ascii_case("TXT"))
+                && record["name"]
+                    .as_str()
+                    .is_some_and(|record_name| record_matches_name(record_name, zone, name))
+                && record["content"].as_str().is_some_and(|content| {
+                    content == value
+                        || content.strip_prefix('"').and_then(|s| s.strip_suffix('"'))
+                            == Some(value)
+                })
+            {
+                matched_ids.insert(
+                    positive_id(&record["id"]).context("DNSHE TXT record has no valid id")?,
+                );
+            }
+        }
+
+        Ok(matched_ids)
     }
 
     async fn dnshe_zone(&self, api: &str, name: &str) -> Result<(String, u64)> {
@@ -212,6 +235,20 @@ fn relative_name<'a>(name: &'a str, zone: &str) -> Option<&'a str> {
         Some("@")
     } else {
         name.strip_suffix(zone)?.strip_suffix('.')
+    }
+}
+
+fn record_matches_name(record: &str, zone: &str, name: &str) -> bool {
+    if record.is_empty() || record == "@" {
+        return name == zone;
+    }
+    let absolute = record.ends_with('.');
+    let record = dns_name(record);
+    // DNSHE lists fully qualified names. Accept an unambiguous relative name as well.
+    if absolute || relative_name(&record, zone).is_some() {
+        record == name
+    } else {
+        relative_name(name, zone) == Some(record.as_str())
     }
 }
 
