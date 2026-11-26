@@ -498,6 +498,8 @@ fn is_provider_secret(key: &str) -> bool {
             | "DP_Id"
             | "DP_Key"
             | "DP_Domain"
+            | "DNSHE_API_KEY"
+            | "DNSHE_API_SECRET"
             | "Ali_Key"
             | "Ali_Secret"
             | "Ali_Domain"
@@ -588,6 +590,22 @@ fn eab_binding(key: &AccountKey, url: &str, kid: &str, encoded_key: &str) -> Res
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dnshe_credentials_reload_for_renewal_unless_persistence_is_disabled() {
+        let home = std::env::temp_dir().join(format!("rust-acmesh-dnshe-{}", uuid::Uuid::new_v4()));
+        let store = Store::new(Some(home.clone()), None, None, None, None).unwrap();
+        let supplied = std::collections::HashMap::from([
+            ("DNSHE_API_KEY".into(), "fixture-key".into()),
+            ("DNSHE_API_SECRET".into(), "fixture-secret".into()),
+        ]);
+        provider_credentials(&store, "dns_dnshe", supplied.clone(), false).unwrap();
+        assert!(!store.account_conf().exists());
+        provider_credentials(&store, "dns_dnshe", supplied.clone(), true).unwrap();
+        let reloaded = provider_credentials(&store, "dns_dnshe", Default::default(), true).unwrap();
+        assert_eq!(reloaded, supplied);
+        std::fs::remove_dir_all(home).unwrap();
+    }
 
     #[test]
     fn west_credentials_persist_and_reload_for_renewal() {

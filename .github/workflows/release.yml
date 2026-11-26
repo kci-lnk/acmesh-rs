@@ -49,6 +49,17 @@ jobs:
         if: matrix.musl
         run: sudo apt-get update && sudo apt-get install --yes musl-tools
       - run: cargo build --locked --release --target ${{ matrix.target }}
+      - name: Verify the native Windows client
+        if: matrix.os == 'windows'
+        shell: pwsh
+        run: |
+          cargo test --locked --target ${{ matrix.target }} dnshe
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $version = & "target/${{ matrix.target }}/release/rust-acmesh.exe" version
+          $expected = 'rust-acmesh ' + '${{ github.ref_name }}'.TrimStart('v')
+          if ($LASTEXITCODE -ne 0 -or $version -ne $expected) {
+            throw "Expected $expected, received $version"
+          }
       - name: Package Windows archive
         if: matrix.os == 'windows'
         shell: pwsh

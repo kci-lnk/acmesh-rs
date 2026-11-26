@@ -10,6 +10,7 @@ use std::{collections::HashMap, time::Duration};
 
 const WEST_CN_API: &str = "https://api.west.cn/API/v2/domain/dns/";
 
+mod dnshe;
 #[cfg(test)]
 mod west_cn_tests;
 
@@ -33,6 +34,9 @@ impl Dns {
                 }
             }
         }
+        if provider.eq_ignore_ascii_case("dns_dnshe") {
+            dnshe::validate_credentials(vars)?;
+        }
         Ok(())
     }
 
@@ -42,8 +46,10 @@ impl Dns {
         let mut builder = Client::builder()
             .danger_accept_invalid_certs(insecure)
             .timeout(Duration::from_secs(30));
-        if provider.eq_ignore_ascii_case("dns_west_cn") {
-            // 307/308 redirects would forward account credentials in the form body.
+        if provider.eq_ignore_ascii_case("dns_west_cn")
+            || provider.eq_ignore_ascii_case("dns_dnshe")
+        {
+            // Redirects could forward provider-specific credentials to another host.
             builder = builder.redirect(reqwest::redirect::Policy::none());
         }
         let client = builder.build()?;
@@ -65,6 +71,7 @@ impl Dns {
             "dns_test" => Ok(()),
             "dns_cf" | "cloudflare" => self.cloudflare(add, name, value).await,
             "dns_dp" | "dnspod" => self.dnspod(add, name, value).await,
+            "dns_dnshe" => self.dnshe(add, name, value, dnshe::API).await,
             "dns_duckdns" => self.duckdns(add, name, value).await,
             "dns_gd" => self.godaddy(add, name, value).await,
             "dns_porkbun" => self.porkbun(add, name, value).await,
@@ -79,7 +86,7 @@ impl Dns {
             "dns_huaweicloud" => self.huaweicloud(add, name, value).await,
             "dns_west_cn" => self.west_cn(add, name, value, WEST_CN_API).await,
             _ => bail!(
-                "unsupported DNS provider {}; supported: dns_ali,dns_baiducloud,dns_cf,dns_dp,dns_duckdns,dns_dynu,dns_dynv6,dns_gd,dns_huaweicloud,dns_porkbun,dns_tencent,dns_west_cn",
+                "unsupported DNS provider {}; supported: dns_ali,dns_baiducloud,dns_cf,dns_dnshe,dns_dp,dns_duckdns,dns_dynu,dns_dynv6,dns_gd,dns_huaweicloud,dns_porkbun,dns_tencent,dns_west_cn",
                 self.provider
             ),
         }

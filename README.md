@@ -92,6 +92,7 @@ rust-acmesh issue -d example.com ...
 | 百度智能云 DNS | `dns_baiducloud` | `BAIDU_ACCESS_KEY_ID`, `BAIDU_SECRET_ACCESS_KEY` | `BAIDU_DOMAIN` 或 `root_domain` |
 | Cloudflare | `dns_cf` | `CF_Token`，或 `CF_Key` + `CF_Email` | `CF_Zone_ID`, `CF_Account_ID` |
 | DNSPod | `dns_dp` | `DP_Id`, `DP_Key` | `DP_Domain` |
+| DNSHE 免费域名 | `dns_dnshe` | `DNSHE_API_KEY`, `DNSHE_API_SECRET` | 自动识别托管域名 |
 | 腾讯云 DNSPod | `dns_tencent` | `Tencent_SecretId`, `Tencent_SecretKey` | — |
 | DuckDNS | `dns_duckdns` | `DuckDNS_Token` | — |
 | Dynu | `dns_dynu` | `Dynu_ClientId`, `Dynu_Secret` | — |
@@ -233,6 +234,8 @@ rust-acmesh issue -d example.com ...
 ```
 
 The supported DNS providers and credential names are listed in the [Chinese provider table](#dns-服务商) above. They are identical on every platform.
+
+For [DNSHE Free Domains](https://github.com/dnshe/DNSHE-FreeDomains/blob/main/docs/api.md), set `DNSHE_API_KEY` and `DNSHE_API_SECRET` from API Management in the DNSHE client area, then use `rust-acmesh issue --dns dns_dnshe -d your-domain`. The client discovers the managed domain automatically and uses its DNS records API for TXT challenges. Supply the same credentials for unattended renewal when using `--no-save-credentials`.
 
 For West.cn, use the account-level credentials supported by [acme.sh](https://github.com/acmesh-official/acme.sh/blob/master/dnsapi/dns_west_cn.sh). Obtain or set your API password in [API settings](https://www.west.cn/manager/API/APIconfig.asp), compute its MD5 locally, and supply that digest as `WEST_Key`. The client sends the digest unchanged. Ensure the API IP allowlist includes the client's outbound IP; see the [official instructions](https://gd.west.cn/faq/list.asp?unid=2590).
 

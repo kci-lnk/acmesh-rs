@@ -232,6 +232,8 @@ fn credentials_from(
         "DP_Id",
         "DP_Key",
         "DP_Domain",
+        "DNSHE_API_KEY",
+        "DNSHE_API_SECRET",
         "Ali_Key",
         "Ali_Secret",
         "Ali_Domain",
@@ -276,6 +278,25 @@ fn credentials_from(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dnshe_reads_environment_and_prefers_explicit_credentials() {
+        let args = Args::try_parse_from([
+            "rust-acmesh",
+            "issue",
+            "--dns",
+            "dns_dnshe",
+            "--env",
+            "DNSHE_API_SECRET=explicit",
+        ])
+        .unwrap();
+        let credentials = credentials_from(&args, |key| match key {
+            "DNSHE_API_KEY" | "DNSHE_API_SECRET" => Some("environment".into()),
+            _ => None,
+        });
+        assert_eq!(credentials["DNSHE_API_KEY"], "environment");
+        assert_eq!(credentials["DNSHE_API_SECRET"], "explicit");
+    }
 
     #[test]
     fn west_credentials_read_environment_and_prefer_explicit_values() {
